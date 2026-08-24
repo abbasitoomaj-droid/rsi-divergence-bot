@@ -1,0 +1,157 @@
+name: RSI Divergence Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rsi-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get files
+        uses: actions/checkout@v4
+
+      - name: Install Python packages
+        run: pip install requests pandas numpy
+
+      - name: Check RSI divergence
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import requests
+          import pandas as pd
+          import numpy as np
+
+          SYMBOL = "BTCUSDT"
+          INTERVAL = "15m"
+
+          token = os.environ.get("TELEGRAM_TOKEN")
+          chat_id = os.environ.get("CHAT_ID")
+
+          url = "https://api.binance.com/api/v3/klines"
+          params = {
+              "symbol": SYMBOL,
+              "interval": INTERVAL,
+              "limit": 100
+          }
+
+          data = requests.get(url, params=params, timeout=20).json()
+
+          df = pd.DataFrame(data, columns=[
+              "time","open","high","low","close","volume",
+              "close_time","qav","trades","tbv","tqv","ignore"
+          ])
+
+          for c in ["high","low","close"]:
+              df[c] = df[c].astype(float)
+
+          # RSI 14
+          delta = df["close"].diff()
+          gain = delta.clip(lower=0)
+          loss = -delta.clip(upper=0)
+
+          avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+          avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+
+          rs = avg_gain / avg_loss.replace(0, np.nan)
+          df["rsi"] = 100 - (100 / (1 + rs))
+
+          left = 3
+          right = 3
+
+          lows = []
+          highs = []
+
+          for i in range(left, len(df) - right):
+              low = df["low"].iloc[i]
+              high = df["high"].iloc[i]
+
+              if low == df["low"].iloc[i-left:i+right+1].min():
+                  lows.append(i)
+
+              if high == df["high"].iloc[i-left:i+right+1].max():
+                  highs.append(i)
+
+          signal = None
+          signal_id = None
+
+          # Bullish divergence
+          if len(lows) >= 2:
+              a, b = lows[-2], lows[-1]
+
+              if (
+                  df["low"].iloc[b] < df["low"].iloc[a]
+                  and df["rsi"].iloc[b] > df["rsi"].iloc[a]
+              ):
+                  signal = (
+                      f"🟢 BULLISH RSI DIVERGENCE\n"
+                      f"{SYMBOL} | {INTERVAL}\n"
+                      f"Price: {df['low'].iloc[b]:.4f}\n"
+                      f"RSI: {df['rsi'].iloc[b]:.2f}"
+                  )
+                  signal_id = f"BULL-{df['time'].iloc[b]}"
+
+          # Bearish divergence
+          if len(highs) >= 2:
+              a, b = highs[-2], highs[-1]
+
+              if (
+                  df["high"].iloc[b] > df["high"].iloc[a]
+                  and df["rsi"].iloc[b] < df["rsi"].iloc[a]
+              ):
+                  signal = (
+                      f"🔴 BEARISH RSI DIVERGENCE\n"
+                      f"{SYMBOL} | {INTERVAL}\n"
+                      f"Price: {df['high'].iloc[b]:.4f}\n"
+                      f"RSI: {df['rsi'].iloc[b]:.2f}"
+                  )
+                  signal_id = f"BEAR-{df['time'].iloc[b]}"
+
+          state_file = "state.json"
+
+          try:
+              with open(state_file, "r") as f:
+                  state = json.load(f)
+          except:
+              state = {"last_signal": ""}
+
+          if signal and signal_id != state.get("last_signal"):
+
+              telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+              requests.post(
+                  telegram_url,
+                  json={
+                      "chat_id": chat_id,
+                      "text": signal
+                  },
+                  timeout=20
+              )
+
+              state["last_signal"] = signal_id
+
+              with open(state_file, "w") as f:
+                  json.dump(state, f)
+
+              print(signal)
+
+          else:
+              print("No new RSI divergence.")
+          PY
+
+      - name: Save signal state
+        run: |
+          git config user.name "RSI Alert Bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "Update RSI signal state"
+          git push
